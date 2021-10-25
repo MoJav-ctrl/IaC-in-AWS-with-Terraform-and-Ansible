@@ -1,0 +1,110 @@
+#These codes require a hosted domain name with AWS Route53 or some other hosting company to work. However, I'd recommend using AWS Route53 for this practice. It is a lot easier
+#To get your domain name, in the terminal type "aws route53 list-hosted-zones"
+#Copy the "Name" value you see. Make sure to copy the ending "." too
+
+
+#Create a DNS variable in variables.tf on the terraform control node
+variable "dns-name" {
+	type = string
+	default = "the Name value you copied in Line 3 above"
+}
+
+
+#Create a dns.tf file on the terraform control node and paste these codes from line 14 to line 50
+#Get already publicly configured Hosted Zone on Route53 -MUST EXIST
+data "aws_route53_zone" "dns" {
+	provider = aws.region-master
+	name = var.dns-name
+}
+
+
+#Create record in hosted zone for ACM Certificate Domain verification
+resource "aws_route53_record" "cert_validation" {
+	provider = aws.region-master
+	for_each = {
+		for val in aws_acm_certificate.jenkins-lb-https.domain_validation_options : val.domain_name => {
+			name = val.resource_record_name
+			record = val.resource_record_value
+			type = val.resource_record_type
+		}
+	}
+	name = each.value.name
+	records = [each.value.record]
+	ttl = 60
+	type = each.value.type
+	zone_id = data.aws_route53_zone.dns.zone_id
+}
+
+
+#Create Alias record towards ALB from Route53
+resource "aws_route53_record" "jenkins" {
+	provider = aws.region-master
+	zone_id = data.aws_route53_zone.dns.zone_id
+	name = join(".", ["jenkins", data.aws_route53_zone.dns.name])
+	type = "A"
+	alias {
+		name = aws_lb.application-lb.dns_name
+		zone_id = aws_lb.application-lb.zone_id
+		evaluate_target_health = true
+	}
+}
+
+
+
+#Create an acm.tf file and paste these codes from line 55 to line 72
+#Create ACM certificate and requests validation via DNS(Route53)
+resource "aws_acm_certificate" "jenkins-lb-https" {
+	provider = aws.region-master
+	domain_name = join(".", ["jenkins", data.aws_route53_zone.dns.name])
+	validation_method = "DNS"
+	tags = {
+		Name = "Jenkins-ACM"
+	}
+}
+
+
+#Validates ACM issued certificate via Route53
+resource "aws_acm_certificate_validation" "cert" {
+	provider = aws.region-master
+	certificate_arn = aws_acm_certificate.jenkins-lb-https.arn
+	for_each = aws_route53_record.cert_validation
+	validation_record_fqdns = [aws_route53_record.cert_validation[each.key].fqdn]
+}
+
+
+#Go to the alb.tf file and change the code in the aws_lb_listener for port 80 to the one below
+resource "aws_lb_listener" "jenkins-listener-http" {
+  provider          = aws.region-master
+  load_balancer_arn = aws_lb.application-lb.arn
+  port              = "80"
+  protocol          = "HTTP"
+  #(This Default action below must be preent in all listeners)
+  default_action {
+    type             = "redirect"
+	redirect {
+		port = "443"
+		protocol = "HTTPS"
+		status_code = "HTTP_301"
+	}
+  }
+}
+
+#Then create a listener for port 443
+resource "aws_lb_listener" "jenkins-listener_https" {
+	provider = aws.region-master
+	load_balancer_arn = aws_lb.application-lb.arn
+	ssl_policy = "ELBSecurityPolicy-2016-08"
+	port = "443"
+	protocol = "HTTPS"
+	certificate_arn = aws_acm_certificate.jenkins-lb-https.arn
+	default_action {
+		type = "forward"
+		target_group_arn = aws_lb_target_group.app-lb-tg.arn
+	}
+}
+
+#Add the following codes to the output.tf file
+output "url" {
+	value = aws_route53_record.jenkins.fqdn
+}
+
